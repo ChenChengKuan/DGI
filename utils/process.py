@@ -1,27 +1,65 @@
-import numpy as np
-import pickle as pkl
-import networkx as nx
-import scipy.sparse as sp
-from scipy.sparse.linalg.eigen.arpack import eigsh
+import h5py
+import nmslib
 import sys
 import torch
+import scipy.sparse as sp
+import numpy as np
+import pickle as pkl
 import torch.nn as nn
+from collections import Counter
+from scipy.sparse.linalg.eigen.arpack import eigsh
 
-def parse_skipgram(fname):
-    with open(fname) as f:
-        toks = list(f.read().split())
-    nb_nodes = int(toks[0])
-    nb_features = int(toks[1])
-    ret = np.empty((nb_nodes, nb_features))
-    it = 2
-    for i in range(nb_nodes):
-        cur_nd = int(toks[it]) - 1
-        it += 1
-        for j in range(nb_features):
-            cur_ft = float(toks[it])
-            ret[cur_nd][j] = cur_ft
-            it += 1
-    return ret
+class Hnsw:
+    def __init__(self, space='cosinesimil', index_params=None,
+                 query_params=None, print_progress=True):
+        self.space = space
+        self.index_params = index_params
+        self.query_params = query_params
+        self.print_progress = print_progress
+
+    def fit(self, X):
+        index_params = self.index_params
+        if index_params is None:
+            index_params = {'M': 16, 'post': 0, 'efConstruction': 400}
+
+        query_params = self.query_params
+        if query_params is None:
+            query_params = {'ef': 90}
+
+        # this is the actual nmslib part, hopefully the syntax should
+        # be pretty readable, the documentation also has a more verbiage
+        # introduction: https://nmslib.github.io/nmslib/quickstart.html
+        index = nmslib.init(space=self.space, method='hnsw')
+        index.addDataPointBatch(X)
+        index.createIndex(index_params, print_progress=self.print_progress)
+        index.setQueryTimeParams(query_params)
+
+        self.index_ = index
+        self.index_params_ = index_params
+        self.query_params_ = query_params
+        return self
+
+    def query(self, vector, topn):
+        # the knnQuery returns indices and corresponding distance
+        # we will throw the distance away for now
+        indices, _ = self.index_.knnQuery(vector, k=topn)
+        return indices
+
+# def parse_skipgram(fname):
+#     with open(fname) as f:
+#         toks = list(f.read().split())
+#     nb_nodes = int(toks[0])
+#     nb_features = int(toks[1])
+#     ret = np.empty((nb_nodes, nb_features))
+#     it = 2
+#     for i in range(nb_nodes):
+#         cur_nd = int(toks[it]) - 1
+#         it += 1
+#         for j in range(nb_features):
+#             cur_ft = float(toks[it])
+#             ret[cur_nd][j] = cur_ft
+#             it += 1
+#     return ret
 
 # Process a (subset of) a TU dataset into standard form
 def process_tu(data, nb_nodes):
@@ -102,44 +140,71 @@ def sample_mask(idx, l):
     mask[idx] = 1
     return np.array(mask, dtype=np.bool)
 
-def load_data(dataset_str): # {'pubmed', 'citeseer', 'cora'}
-    """Load data."""
-    names = ['x', 'y', 'tx', 'ty', 'allx', 'ally', 'graph']
-    objects = []
-    for i in range(len(names)):
-        with open("data/ind.{}.{}".format(dataset_str, names[i]), 'rb') as f:
-            if sys.version_info > (3, 0):
-                objects.append(pkl.load(f, encoding='latin1'))
-            else:
-                objects.append(pkl.load(f))
+def load_data(dataset_str):
+    file_latent = h5py.File(dataset_str, 'r')
+    latent = np.array(file_latent['features'])
+    coords = np.array(file_latent['coords'])
+    features = np.zeros((latent.shape[0], 128))
 
-    x, y, tx, ty, allx, ally, graph = tuple(objects)
-    test_idx_reorder = parse_index_file("data/ind.{}.test.index".format(dataset_str))
-    test_idx_range = np.sort(test_idx_reorder)
+    print("Convert latent code to latent counting features...")
+    for idx, latent_feat in tqdm(enumerate(latent)):
+        count_feat = Counter(latent_feat.flatten())
+        feat_index = count_feat.keys()
+        feat_value = count_feat.values()
+        features[idx][list(feat_index)] = list(feat_value)
+    
+    print("Build approximate knn...")
+    model  = Hnsw(space="l2")
+    model = model.fit(features)
 
-    if dataset_str == 'citeseer':
-        # Fix citeseer dataset (there are some isolated nodes in the graph)
-        # Find isolated nodes, add them as zero-vecs into the right position
-        test_idx_range_full = range(min(test_idx_reorder), max(test_idx_reorder)+1)
-        tx_extended = sp.lil_matrix((len(test_idx_range_full), x.shape[1]))
-        tx_extended[test_idx_range-min(test_idx_range), :] = tx
-        tx = tx_extended
-        ty_extended = np.zeros((len(test_idx_range_full), y.shape[1]))
-        ty_extended[test_idx_range-min(test_idx_range), :] = ty
-        ty = ty_extended
+    print("Construct graph")
+    row_index = []
+    col_index = []
+    for row, count in tqdm(enumerate(features)):
+        nearest_neighbor_index = model.query(features[row], topn=6)
+        for col in range(1, len(nearest_neighbor_index)):
+            row_index.append(row)
+            col_index.append(nearest_neighbor_index[col])
+    adj = sp.coo_matrix((np.ones(len(row_index)), (row_index, col_index)), shape=(features.shape[0], features.shape[0]))
+    return features, adj
+# def load_data(dataset_str): # {'pubmed', 'citeseer', 'cora'}
+#     """Load data."""
+#     names = ['x', 'y', 'tx', 'ty', 'allx', 'ally', 'graph']
+#     objects = []
+#     for i in range(len(names)):
+#         with open("data/ind.{}.{}".format(dataset_str, names[i]), 'rb') as f:
+#             if sys.version_info > (3, 0):
+#                 objects.append(pkl.load(f, encoding='latin1'))
+#             else:
+#                 objects.append(pkl.load(f))
 
-    features = sp.vstack((allx, tx)).tolil()
-    features[test_idx_reorder, :] = features[test_idx_range, :]
-    adj = nx.adjacency_matrix(nx.from_dict_of_lists(graph))
+#     x, y, tx, ty, allx, ally, graph = tuple(objects)
+#     test_idx_reorder = parse_index_file("data/ind.{}.test.index".format(dataset_str))
+#     test_idx_range = np.sort(test_idx_reorder)
 
-    labels = np.vstack((ally, ty))
-    labels[test_idx_reorder, :] = labels[test_idx_range, :]
+#     if dataset_str == 'citeseer':
+#         # Fix citeseer dataset (there are some isolated nodes in the graph)
+#         # Find isolated nodes, add them as zero-vecs into the right position
+#         test_idx_range_full = range(min(test_idx_reorder), max(test_idx_reorder)+1)
+#         tx_extended = sp.lil_matrix((len(test_idx_range_full), x.shape[1]))
+#         tx_extended[test_idx_range-min(test_idx_range), :] = tx
+#         tx = tx_extended
+#         ty_extended = np.zeros((len(test_idx_range_full), y.shape[1]))
+#         ty_extended[test_idx_range-min(test_idx_range), :] = ty
+#         ty = ty_extended
 
-    idx_test = test_idx_range.tolist()
-    idx_train = range(len(y))
-    idx_val = range(len(y), len(y)+500)
+#     features = sp.vstack((allx, tx)).tolil()
+#     features[test_idx_reorder, :] = features[test_idx_range, :]
+#     adj = nx.adjacency_matrix(nx.from_dict_of_lists(graph))
 
-    return adj, features, labels, idx_train, idx_val, idx_test
+#     labels = np.vstack((ally, ty))
+#     labels[test_idx_reorder, :] = labels[test_idx_range, :]
+
+#     idx_test = test_idx_range.tolist()
+#     idx_train = range(len(y))
+#     idx_val = range(len(y), len(y)+500)
+
+#     return adj, features, labels, idx_train, idx_val, idx_test
 
 def sparse_to_tuple(sparse_mx, insert_batch=False):
     """Convert sparse matrix to tuple representation."""
